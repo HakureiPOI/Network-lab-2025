@@ -114,5 +114,30 @@ typedef struct peso_hdr {
  * @return uint16_t 计算得到的16位校验和
  */
 uint16_t transport_checksum(uint8_t protocol, buf_t *buf, uint8_t *src_ip, uint8_t *dst_ip) {
-    // TO-DO
+    uint16_t total_len = 12 + buf->len;
+    if (total_len % 2 == 1) total_len++;  // 补齐为偶数
+
+    uint8_t *temp = (uint8_t *)malloc(total_len);
+    if (!temp) return 0;  // 内存分配失败
+
+    // 构造伪首部
+    memcpy(temp, src_ip, 4);
+    memcpy(temp + 4, dst_ip, 4);
+    temp[8] = 0;
+    temp[9] = protocol;
+    temp[10] = buf->len >> 8;
+    temp[11] = buf->len & 0xFF;
+
+    // 拷贝数据部分
+    memcpy(temp + 12, buf->data, buf->len);
+
+    // 若原始为奇数，末尾补0（虽然 malloc 已初始化为未知数据，最好手动补0）
+    if ((buf->len % 2) == 1) {
+        temp[total_len - 1] = 0;
+    }
+
+    uint16_t sum = checksum16((uint16_t *)temp, total_len);
+    free(temp);
+    return sum;
 }
+
