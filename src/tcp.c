@@ -6,6 +6,21 @@
 #include <assert.h>
 #include <stdbool.h>
 
+#include <stdlib.h>
+#include <time.h>
+#include <stdint.h>
+
+// 随机生成一个32位整数，用作初始序列号（ISN）
+uint32_t random32() {
+    static int initialized = 0;
+    if (!initialized) {
+        srand((unsigned)time(NULL));
+        initialized = 1;
+    }
+    return ((uint32_t)rand() << 16) | rand();
+}
+
+
 /**
  * @brief TCP 处理程序表
  *
@@ -117,7 +132,26 @@ static inline void tcp_close_connection(uint8_t remote_ip[NET_IP_LEN], uint16_t 
  */
 void tcp_out(tcp_conn_t *tcp_conn, buf_t *buf, uint16_t src_port, uint8_t *dst_ip, uint16_t dst_port, uint8_t flags) {
     /* =============================== TODO 1 BEGIN =============================== */
+    // Step1: 添加 TCP 报头
+    buf_add_header(buf, sizeof(tcp_hdr_t));
+    tcp_hdr_t *hdr = (tcp_hdr_t *)buf->data;
 
+    // Step2: 填充 TCP 首部字段（注意字节序）
+    hdr->src_port16 = swap16(src_port);             // 源端口
+    hdr->dst_port16 = swap16(dst_port);             // 目标端口
+    hdr->seq = swap32(tcp_conn->seq);               // 当前发送的序列号
+    hdr->ack = swap32(tcp_conn->ack);               // 当前发送的确认号
+    hdr->doff = (sizeof(tcp_hdr_t) / 4) << 4;        // 首部长度字段，高4位 = 5（20字节）
+    hdr->flags = flags;                             // 标志位（ACK/SYN/FIN）
+    hdr->win = swap16(TCP_MAX_WINDOW_SIZE);         // 窗口大小，最大65535
+    hdr->uptr = 0;                                   // 紧急指针，设为0
+
+    // Step3: 校验和处理
+    hdr->checksum16 = 0;  // 清零后再计算
+    hdr->checksum16 = transport_checksum(NET_PROTOCOL_TCP, buf, net_if_ip, dst_ip);
+
+    // Step4: 调用 ip_out 发送 TCP 报文
+    ip_out(buf, dst_ip, NET_PROTOCOL_TCP);
     /* =============================== TODO 1 END =============================== */
 }
 
@@ -164,55 +198,64 @@ void tcp_in(buf_t *buf, uint8_t *src_ip) {
      // 根据当前 TCP 连接的状态进行不同的处理    
     switch (tcp_conn->state) {
         case TCP_STATE_LISTEN:
-            // TODO: 仅在收到连接报文时（SYN报文）才做出处理，否则直接返回
-
-            // TODO: 初始化 TCP 连接上下文（tcp_conn结构体）的seq字段
-
-            // TODO: 填写 TCP 连接上下文（tcp_conn结构体）的ack字段
-
-            // TODO: 填写回复标志 send_flags
-
-            // TODO: 进行状态转移
-
+            if (!TCP_FLG_ISSET(recv_flags, TCP_FLG_SYN))
+                return;
+            tcp_conn->seq = random32();  // 初始化 SEQ
+            tcp_conn->ack = remote_seq + 1;  // 设置 ACK
+            send_flags = TCP_FLG_SYN | TCP_FLG_ACK;
+            tcp_conn->state = TCP_STATE_SYN_RECEIVED;
             break;
 
         case TCP_STATE_SYN_RECEIVED:
-            // TODO: 仅在收到确认报文时（ACK报文）才做出处理，否则直接返回
-
-            // TODO: 进行状态转移
-
+            if (!TCP_FLG_ISSET(recv_flags, TCP_FLG_ACK))
+                return;
+            tcp_conn->state = TCP_STATE_ESTABLISHED;
             break;
 
         case TCP_STATE_ESTABLISHED:
-            // 未收到顺序包，丢弃并发送重复 ACK
             if (remote_seq != tcp_conn->ack) {
                 buf_init(&txbuf, 0);
                 tcp_out(tcp_conn, &txbuf, host_port, remote_ip, remote_port, TCP_FLG_ACK);
                 return;
             }
-            // TODO: 计算接收到的数据长度，更新 ACK
 
-            // TODO: 如果接收报文携带数据，则填写回复标志 send_flags 发送ACK
+            // 数据长度 = 总长 - TCP 头部长度
+            uint16_t data_len = buf->len - tcp_hdr_sz;
+            if (data_len > 0) {
+                tcp_conn->ack += data_len;
+                send_flags |= TCP_FLG_ACK;
+            }
 
-            // TODO: 如果收到 FIN 报文，则增加 send_flags 相应标志位，并且进行状态转移
-
+            if (TCP_FLG_ISSET(recv_flags, TCP_FLG_FIN)) {
+                tcp_conn->ack += 1;
+                send_flags |= TCP_FLG_ACK;
+                tcp_conn->state = TCP_STATE_LAST_ACK;
+            }
             break;
 
         case TCP_STATE_LAST_ACK:
-            // TODO: 仅在收到确认报文时（ACK报文）才做出处理，否则直接返回
-
-            // TODO: 关闭 TCP 连接
-
-            break;
+            if (!TCP_FLG_ISSET(recv_flags, TCP_FLG_ACK))
+                return;
+            tcp_close_connection(remote_ip, remote_port, host_port);
+            return;
 
         default:
             printf("do not support state %d\n", tcp_conn->state);
-            break;
+            return;
     }
 
     /* Step2 ：如果接收报文携带数据，则将数据部分交付给上层应用 */
-    // TODO
-
+    if (tcp_hdr_sz < buf->len) {
+        buf_remove_header(buf, tcp_hdr_sz);
+        tcp_handler_t *handler_ptr = map_get(&tcp_handler_table, &host_port);
+        if (!handler_ptr) {
+            buf_add_header(buf, tcp_hdr_sz);
+            icmp_unreachable(buf, src_ip, ICMP_CODE_PORT_UNREACH);
+            return;
+        }
+        tcp_handler_t handler = *handler_ptr;
+        handler(tcp_conn, buf->data, buf->len, src_ip, remote_port);
+    }
 
     /* Step3 ：调用tcp_out()发送回复报文，更新TCP连接序列号。 */
     // 如果无需回复，则接收逻辑结束
@@ -225,9 +268,12 @@ void tcp_in(buf_t *buf, uint8_t *src_ip) {
         return;
     }
 
-    // TODO:  初始化一个新的缓冲区，发送回复报文
+    buf_init(&txbuf, 0);
+    tcp_out(tcp_conn, &txbuf, host_port, remote_ip, remote_port, send_flags);
 
-    // TODO: 更新序列号
+    // SYN/FIN 占一个序列空间
+    if (TCP_FLG_ISSET(send_flags, TCP_FLG_SYN) || TCP_FLG_ISSET(send_flags, TCP_FLG_FIN))
+        tcp_conn->seq += 1;
 
     /* =============================== TODO 2 END =============================== */
 }
@@ -273,6 +319,7 @@ void tcp_send(tcp_conn_t *tcp_conn, uint8_t *data, uint16_t len, uint16_t src_po
 void tcp_init() {
     map_init(&tcp_handler_table, sizeof(uint16_t), sizeof(tcp_handler_t), 0, 0, NULL, NULL);
     map_init(&tcp_conn_table, sizeof(tcp_key_t), sizeof(tcp_conn_t), 0, 0, NULL, NULL);
+
     net_add_protocol(NET_PROTOCOL_TCP, tcp_in);
     // 初始化随机数种子，为生成 TCP 初始序列号提供支持
     srand(time(NULL));
