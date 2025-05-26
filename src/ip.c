@@ -45,17 +45,16 @@ void ip_in(buf_t *buf, uint8_t *src_mac)
     memcpy(src_ip, ip_hdr->src_ip, NET_IP_LEN);
     uint8_t protocol = ip_hdr->protocol;
 
-    // 若协议类型不支持，则返回 ICMP 协议不可达
-    if (protocol != NET_PROTOCOL_ICMP && protocol != NET_PROTOCOL_UDP) {
-        icmp_unreachable(buf, src_ip, ICMP_CODE_PROTOCOL_UNREACH);
-        return;
-    }
-
     // 去除 IP 头部，准备向上层协议传递
     buf_remove_header(buf, ip_hdr->hdr_len * IP_HDR_LEN_PER_BYTE);
 
     // 调用统一接口，将数据交由上层协议处理
-    net_in(buf, protocol, src_ip);
+    int ret = net_in(buf, protocol, src_ip);
+    if (ret == -1) {
+        // 若协议类型不支持，则返回 ICMP 协议不可达
+        icmp_unreachable(buf, src_ip, ICMP_CODE_PROTOCOL_UNREACH);
+        return;
+    }
 }
 
 
