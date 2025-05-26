@@ -5,6 +5,7 @@
 
 #include <stdio.h>
 #include <string.h>
+
 /**
  * @brief 初始的arp包
  *
@@ -57,7 +58,21 @@ void arp_print() {
  * @param target_ip 想要知道的目标的ip地址
  */
 void arp_req(uint8_t *target_ip) {
-    // TO-DO
+    // 初始化发送缓冲区
+    buf_init(&txbuf, sizeof(arp_pkt_t));
+    arp_pkt_t *pkt = (arp_pkt_t *)txbuf.data;
+
+    // 使用初始模板填充通用字段
+    memcpy(pkt, &arp_init_pkt, sizeof(arp_pkt_t));
+
+    // 设置操作类型为ARP请求（opcode = 1）
+    pkt->opcode16 = swap16(ARP_REQUEST);
+
+    // 设置目标IP地址
+    memcpy(pkt->target_ip, target_ip, NET_IP_LEN);
+
+    // 目标MAC设置为广播地址，ARP请求使用广播方式发送
+    ethernet_out(&txbuf, ether_broadcast_mac, NET_PROTOCOL_ARP);
 }
 
 /**
@@ -67,7 +82,22 @@ void arp_req(uint8_t *target_ip) {
  * @param target_mac 目标mac地址
  */
 void arp_resp(uint8_t *target_ip, uint8_t *target_mac) {
-    // TO-DO
+    // 初始化发送缓冲区
+    buf_init(&txbuf, sizeof(arp_pkt_t));
+    arp_pkt_t *pkt = (arp_pkt_t *)txbuf.data;
+
+    // 使用初始模板填充通用字段
+    memcpy(pkt, &arp_init_pkt, sizeof(arp_pkt_t));
+
+    // 设置操作类型为ARP响应（opcode = 2）
+    pkt->opcode16 = swap16(ARP_REPLY);
+
+    // 设置目标IP和目标MAC（即对方地址）
+    memcpy(pkt->target_ip, target_ip, NET_IP_LEN);
+    memcpy(pkt->target_mac, target_mac, NET_MAC_LEN);
+
+    // 单播发送ARP响应
+    ethernet_out(&txbuf, target_mac, NET_PROTOCOL_ARP);
 }
 
 /**
@@ -77,7 +107,34 @@ void arp_resp(uint8_t *target_ip, uint8_t *target_mac) {
  * @param src_mac 源mac地址
  */
 void arp_in(buf_t *buf, uint8_t *src_mac) {
-    // TO-DO
+    // 数据包长度校验
+    if (buf->len < sizeof(arp_pkt_t)) return;
+
+    arp_pkt_t *pkt = (arp_pkt_t *)buf->data;
+
+    // 校验ARP报文格式是否合法
+    if (swap16(pkt->hw_type16) != ARP_HW_ETHER ||
+        swap16(pkt->pro_type16) != NET_PROTOCOL_IP ||
+        pkt->hw_len != NET_MAC_LEN ||
+        pkt->pro_len != NET_IP_LEN) return;
+
+    // 更新ARP表（记录对方IP与MAC）
+    map_set(&arp_table, pkt->sender_ip, pkt->sender_mac);
+
+    // 检查是否有等待该IP地址回复的缓存包
+    void *cached_buf = map_get(&arp_buf, pkt->sender_ip);
+    if (cached_buf) {
+        // 发送缓存数据包
+        ethernet_out(cached_buf, pkt->sender_mac, NET_PROTOCOL_IP);
+        // 删除缓存项
+        map_delete(&arp_buf, pkt->sender_ip);
+    }
+
+    // 如果是ARP请求，且目标IP为本机IP，则发送ARP响应
+    if (swap16(pkt->opcode16) == ARP_REQUEST &&
+        memcmp(pkt->target_ip, net_if_ip, NET_IP_LEN) == 0) {
+        arp_resp(pkt->sender_ip, pkt->sender_mac);
+    }
 }
 
 /**
@@ -88,7 +145,21 @@ void arp_in(buf_t *buf, uint8_t *src_mac) {
  * @param protocol 上层协议
  */
 void arp_out(buf_t *buf, uint8_t *ip) {
-    // TO-DO
+    // 查询ARP表中是否存在对应MAC地址
+    uint8_t *mac = map_get(&arp_table, ip);
+
+    if (mac) {
+        // 若找到MAC，直接发送
+        ethernet_out(buf, mac, NET_PROTOCOL_IP);
+    } else {
+        // 未找到MAC，检查是否已缓存该IP的包
+        if (!map_get(&arp_buf, ip)) {
+            // 若尚未发送ARP请求，缓存数据包并发出ARP请求
+            map_set(&arp_buf, ip, buf);
+            arp_req(ip);
+        }
+        // 否则等待前一个ARP请求响应，无需重复发送
+    }
 }
 
 /**
